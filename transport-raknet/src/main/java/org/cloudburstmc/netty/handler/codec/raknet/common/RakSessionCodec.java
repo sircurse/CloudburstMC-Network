@@ -36,14 +36,9 @@ import org.cloudburstmc.netty.util.*;
 import java.net.Inet6Address;
 import java.net.InetSocketAddress;
 import java.util.ArrayDeque;
-import java.util.Collection;
 import java.util.Iterator;
 import java.util.Queue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BiConsumer;
-import java.util.function.Consumer;
-import java.util.function.ObjIntConsumer;
 
 import static org.cloudburstmc.netty.channel.raknet.RakConstants.*;
 
@@ -68,6 +63,12 @@ public class RakSessionCodec extends ChannelDuplexHandler {
     private int reliabilityWriteIndex;
     private int[] orderReadIndex;
     private int[] orderWriteIndex;
+
+    // Buffer for reliable frames waiting for window space
+    private static final int RELIABLE_WINDOW_SIZE = 512;
+    private static final int RELIABLE_INDEX_MASK  = 0xFFFFFF;
+    private int lastAckedReliableIndex = -1;
+    private final ArrayDeque<EncapsulatedPacket> deferredReliable = new ArrayDeque<>(1024);
 
     private RoundRobinArray<SplitPacketHelper> splitPackets;
     private BitQueue reliableDatagramQueue;
@@ -134,7 +135,6 @@ public class RakSessionCodec extends ChannelDuplexHandler {
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         super.channelInactive(ctx);
         if (this.state == RakState.DISCONNECTED && this.tickFuture == null) {
-            // Already deinitialized
             return;
         }
         this.setState(RakState.DISCONNECTED);
@@ -174,6 +174,11 @@ public class RakSessionCodec extends ChannelDuplexHandler {
                 packet.release();
             }
             outgoingPackets.release();
+        }
+
+        EncapsulatedPacket p;
+        while ((p = this.deferredReliable.pollFirst()) != null) {
+            p.release();
         }
 
         if (log.isTraceEnabled()) {
@@ -428,12 +433,18 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         if (maxQueuedBytes > 0) {
             int queuedBytes = 0;
             try {
-                for (EncapsulatedPacket packet : this.outgoingPackets) {
-                    queuedBytes += packet.getBuffer().readableBytes();
-                    if (queuedBytes > maxQueuedBytes) {
-                        this.disconnect(RakDisconnectReason.QUEUE_TOO_LONG);
-                        return;
+                for (EncapsulatedPacket p : this.outgoingPackets) {
+                    queuedBytes += p.getBuffer().readableBytes();
+                }
+                if (this.deferredReliable != null) {
+                    for (EncapsulatedPacket p : this.deferredReliable) {
+                        queuedBytes += p.getBuffer().readableBytes();
                     }
+                }
+
+                if (queuedBytes > maxQueuedBytes) {
+                    this.disconnect(RakDisconnectReason.QUEUE_TOO_LONG);
+                    return;
                 }
             } finally {
                 RakChannelMetrics metrics = this.getMetrics();
@@ -534,6 +545,15 @@ public class RakSessionCodec extends ChannelDuplexHandler {
                         this.onIncomingNack(ctx, datagram, curTime);
                     } else {
                         this.onIncomingAck(datagram, curTime);
+                        for (final EncapsulatedPacket ep : datagram.getPackets()) {
+                            if (ep.getReliability().isReliable()) {
+                                int idx = ep.getReliabilityIndex();
+                                if (lastAckedReliableIndex == -1 || seqGreater(idx, lastAckedReliableIndex)) {
+                                    lastAckedReliableIndex = idx;
+                                }
+                            }
+                        }
+                        drainDeferredReliableIntoDatagrams(ctx, curTime, this.getMtu());
                     }
                 }
             }
@@ -610,6 +630,12 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         EncapsulatedPacket packet;
 
         while ((packet = this.outgoingPackets.peek()) != null) {
+            if (packet.getReliability().isReliable() && !windowAllows(packet)) {
+                this.outgoingPackets.remove();
+                this.deferredReliable.addLast(packet);
+                continue;
+            }
+
             int size = packet.getSize();
             if (transmissionBandwidth < size) {
                 break;
@@ -618,7 +644,6 @@ public class RakSessionCodec extends ChannelDuplexHandler {
             transmissionBandwidth -= size;
             this.outgoingPackets.remove();
 
-            // Send full datagram
             if (!datagram.tryAddPacket(packet, mtuSize)) {
                 this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
 
@@ -633,17 +658,40 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         if (!datagram.getPackets().isEmpty()) {
             this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
         }
+
+        if (!this.deferredReliable.isEmpty()) {
+            drainDeferredReliableIntoDatagrams(ctx, curTime, mtuSize);
+        }
     }
 
     private void sendImmediate(ChannelHandlerContext ctx, EncapsulatedPacket[] packets) {
         long curTime = System.currentTimeMillis();
+        int mtu = this.getMtu();
+
+        RakDatagramPacket datagram = RakDatagramPacket.newInstance();
+        datagram.setSendTime(curTime);
+
         for (EncapsulatedPacket packet : packets) {
-            RakDatagramPacket datagram = RakDatagramPacket.newInstance();
-            datagram.setSendTime(curTime);
-            if (!datagram.tryAddPacket(packet, this.getMtu())) {
-                throw new IllegalArgumentException("Packet too large to fit in MTU (size: " + packet.getSize() + ", MTU: " + this.getMtu() + ")");
+            if (packet.getReliability().isReliable() && !windowAllows(packet)) {
+                this.deferredReliable.addLast(packet);
+                continue;
             }
+
+            if (!datagram.tryAddPacket(packet, mtu)) {
+                this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+                datagram = RakDatagramPacket.newInstance();
+                datagram.setSendTime(curTime);
+                if (!datagram.tryAddPacket(packet, mtu)) {
+                    throw new IllegalArgumentException("Packet too large to fit in MTU (size: " + packet.getSize() + ", MTU: " + mtu + ")");
+                }
+            }
+        }
+
+        if (!datagram.getPackets().isEmpty()) {
             this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+        }
+        if (!this.deferredReliable.isEmpty()) {
+            drainDeferredReliableIntoDatagrams(ctx, curTime, mtu);
         }
         ctx.flush();
     }
@@ -894,5 +942,54 @@ public class RakSessionCodec extends ChannelDuplexHandler {
 
     public Channel getChannel() {
         return channel;
+    }
+
+    private void drainDeferredReliableIntoDatagrams(ChannelHandlerContext ctx, long curTime, int mtuSize) {
+        if (deferredReliable.isEmpty()) return;
+
+        int transmissionBandwidth = this.slidingWindow.getTransmissionBandwidth();
+        RakDatagramPacket datagram = RakDatagramPacket.newInstance();
+        datagram.setSendTime(curTime);
+
+        while (!deferredReliable.isEmpty()) {
+            EncapsulatedPacket p = deferredReliable.peekFirst();
+            if (!windowAllows(p)) break;
+
+            int size = p.getSize();
+            if (transmissionBandwidth < size) break;
+
+            if (!datagram.tryAddPacket(p, mtuSize)) {
+                this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+                datagram = RakDatagramPacket.newInstance();
+                datagram.setSendTime(curTime);
+                if (!datagram.tryAddPacket(p, mtuSize)) {
+                    throw new IllegalArgumentException("Packet too large to fit in MTU (size: " + p.getSize() + ", MTU: " + mtuSize + ")");
+                }
+            }
+            transmissionBandwidth -= size;
+            deferredReliable.pollFirst();
+        }
+
+        if (!datagram.getPackets().isEmpty()) {
+            this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+        }
+    }
+
+    private static int seqDistance(int a, int b) {
+        return (a - b) & RELIABLE_INDEX_MASK;
+    }
+
+    private static boolean seqGreater(int a, int b) {
+        int diff = (a - b) & RELIABLE_INDEX_MASK;
+        return diff != 0 && diff < ((RELIABLE_INDEX_MASK + 1) >>> 1);
+    }
+
+    private boolean windowAllows(EncapsulatedPacket p) {
+        int idx = p.getReliabilityIndex();
+        if (lastAckedReliableIndex == -1) {
+            lastAckedReliableIndex = (idx - 1) & RELIABLE_INDEX_MASK;
+            return true;
+        }
+        return seqDistance(idx, lastAckedReliableIndex) < RELIABLE_WINDOW_SIZE;
     }
 }
