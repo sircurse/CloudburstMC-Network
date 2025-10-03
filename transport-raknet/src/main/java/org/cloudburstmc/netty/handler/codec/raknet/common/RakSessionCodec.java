@@ -35,6 +35,7 @@ import org.cloudburstmc.netty.util.*;
 
 import java.net.Inet6Address;
 import java.net.InetSocketAddress;
+import java.nio.channels.Channel;
 import java.util.ArrayDeque;
 import java.util.Iterator;
 import java.util.Queue;
@@ -69,6 +70,7 @@ public class RakSessionCodec extends ChannelDuplexHandler {
     private static final int RELIABLE_INDEX_MASK  = 0xFFFFFF;
     private int lastAckedReliableIndex = -1;
     private final ArrayDeque<EncapsulatedPacket> deferredReliable = new ArrayDeque<>(1024);
+    private final boolean[] delivered = new boolean[RELIABLE_WINDOW_SIZE + 1];
 
     private RoundRobinArray<SplitPacketHelper> splitPackets;
     private BitQueue reliableDatagramQueue;
@@ -545,15 +547,17 @@ public class RakSessionCodec extends ChannelDuplexHandler {
                         this.onIncomingNack(ctx, datagram, curTime);
                     } else {
                         this.onIncomingAck(datagram, curTime);
+                        boolean sawReliable = false;
                         for (final EncapsulatedPacket ep : datagram.getPackets()) {
                             if (ep.getReliability().isReliable()) {
-                                int idx = ep.getReliabilityIndex();
-                                if (lastAckedReliableIndex == -1 || seqGreater(idx, lastAckedReliableIndex)) {
-                                    lastAckedReliableIndex = idx;
-                                }
+                                sawReliable = true;
+                                markDeliveredReliable(ep.getReliabilityIndex());
                             }
                         }
-                        drainDeferredReliableIntoDatagrams(ctx, curTime, this.getMtu());
+                        if (sawReliable) {
+                            advanceConsecutiveAcks();
+                            drainDeferredReliableIntoDatagrams(ctx, curTime, this.getMtu());
+                        }
                     }
                 }
             }
@@ -990,6 +994,38 @@ public class RakSessionCodec extends ChannelDuplexHandler {
             lastAckedReliableIndex = (idx - 1) & RELIABLE_INDEX_MASK;
             return true;
         }
-        return seqDistance(idx, lastAckedReliableIndex) < RELIABLE_WINDOW_SIZE;
+        return seqDistance(idx, lastAckedReliableIndex) <= RELIABLE_WINDOW_SIZE;
+    }
+
+    private void markDeliveredReliable(int idx) {
+        if (lastAckedReliableIndex == -1) {
+            // initialize baseline just before the first ack we ever see
+            lastAckedReliableIndex = (idx - 1) & RELIABLE_INDEX_MASK;
+        }
+        int d = seqDistance(idx, lastAckedReliableIndex); // distance in 24-bit space
+        if (d >= 1 && d <= RELIABLE_WINDOW_SIZE) {
+            delivered[d] = true; // mark as delivered within window
+        }
+    }
+
+    private void advanceConsecutiveAcks() {
+        int step = 1;
+        while (step <= RELIABLE_WINDOW_SIZE && delivered[step]) {
+            delivered[step] = false;
+            step++;
+        }
+        int advanced = step - 1;
+        if (advanced > 0) {
+            lastAckedReliableIndex = (lastAckedReliableIndex + advanced) & RELIABLE_INDEX_MASK;
+
+            // shift window flags down by 'advanced'
+            int remain = RELIABLE_WINDOW_SIZE - advanced;
+            if (remain > 0) {
+                System.arraycopy(delivered, advanced + 1, delivered, 1, remain);
+            }
+            for (int i = remain + 1; i <= RELIABLE_WINDOW_SIZE; i++) {
+                delivered[i] = false;
+            }
+        }
     }
 }
