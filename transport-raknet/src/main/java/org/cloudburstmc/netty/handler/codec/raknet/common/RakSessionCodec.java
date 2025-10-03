@@ -999,12 +999,11 @@ public class RakSessionCodec extends ChannelDuplexHandler {
 
     private void markDeliveredReliable(int idx) {
         if (lastAckedReliableIndex == -1) {
-            // initialize baseline just before the first ack we ever see
             lastAckedReliableIndex = (idx - 1) & RELIABLE_INDEX_MASK;
         }
-        int d = seqDistance(idx, lastAckedReliableIndex); // distance in 24-bit space
+        int d = seqDistance(idx, lastAckedReliableIndex);
         if (d >= 1 && d <= RELIABLE_WINDOW_SIZE) {
-            delivered[d] = true; // mark as delivered within window
+            delivered[d] = true;
         }
     }
 
@@ -1018,7 +1017,6 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         if (advanced > 0) {
             lastAckedReliableIndex = (lastAckedReliableIndex + advanced) & RELIABLE_INDEX_MASK;
 
-            // shift window flags down by 'advanced'
             int remain = RELIABLE_WINDOW_SIZE - advanced;
             if (remain > 0) {
                 System.arraycopy(delivered, advanced + 1, delivered, 1, remain);
