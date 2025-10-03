@@ -35,7 +35,6 @@ import org.cloudburstmc.netty.util.*;
 
 import java.net.Inet6Address;
 import java.net.InetSocketAddress;
-import java.nio.channels.Channel;
 import java.util.ArrayDeque;
 import java.util.Iterator;
 import java.util.Queue;
